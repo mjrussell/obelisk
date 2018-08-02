@@ -16,12 +16,13 @@ import Data.Semigroup ((<>))
 import Data.Streaming.Network (bindPortTCP)
 import qualified Data.Text as T
 import Language.Javascript.JSaddle.Run (syncPoint)
+import Language.Javascript.JSaddle.Types (JSM)
 import Language.Javascript.JSaddle.WebSockets
 import Network.HTTP.Client (Manager, defaultManagerSettings, newManager)
 import qualified Network.HTTP.ReverseProxy as RP
 import qualified Network.HTTP.Types as H
 import Network.Socket
-import Network.Wai (Application)
+import Network.Wai (Application, Middleware)
 import qualified Network.Wai as W
 import Network.Wai.Handler.Warp
 import Network.Wai.Handler.Warp.Internal (settingsHost, settingsPort)
@@ -64,31 +65,47 @@ runWidget :: RunConfig -> (StaticWidget () (), Widget () ()) -> IO ()
 runWidget conf (h, b) = do
   uri <- fromMaybe defAppUri <$> getConfigRoute
   let port = fromIntegral $ fromMaybe 80 $ uri ^? uriAuthority . _Right . authPort . _Just
+      -- FIXME: Pull out to the command line via RunConfig or other settings
+      liveReload = True
       redirectHost = _runConfig_redirectHost conf
       redirectPort = _runConfig_redirectPort conf
       beforeMainLoop = do
         putStrLn $ "Frontend running on " <> T.unpack (URI.render uri)
-      settings = setBeforeMainLoop beforeMainLoop (setPort port (setTimeout 3600 defaultSettings))
-  bracket
-    (bindPortTCPRetry settings (logPortBindErr port) (_runConfig_retryTimeout conf))
-    close
-    (\skt -> do
-        man <- newManager defaultManagerSettings
-        app <- obeliskApp defaultConnectionOptions h b (fallbackProxy redirectHost redirectPort man)
-        runSettingsSocket settings skt app)
+      settings = setPort port (setTimeout 3600 defaultSettings)
+  man <- newManager defaultManagerSettings
+  backend <- fallbackProxy redirectHost redirectPort man
+  if liveReload
+    then debugWrapper $ \withRefresh registerContext -> do
+      app <- obeliskApp defaultConnectionOptions h b backend withRefresh registerContext True
+      runSettings settings app
+    else do
+      app <- obeliskApp defaultConnectionOptions h b backend id (pure ()) False
+      runSettings settings app
 
-obeliskApp :: ConnectionOptions -> StaticWidget () () -> Widget () () -> Application -> IO Application
-obeliskApp opts h b backend = do
+-- TODO anyway we can get the original bracket/bindPortTCPRetry back in?
+--  bracket
+--    (bindPortTCPRetry settings (logPortBindErr port) (_runConfig_retryTimeout conf))
+--    close
+--    (\skt -> do
+--        --app <- obeliskApp defaultConnectionOptions h b (fallbackProxy redirectHost redirectPort man)
+--        --runSettingsSocket settings skt app)
+--        debugWrapper $ \withRefresh registerContext -> do
+--          app <- obeliskAppDebug defaultConnectionOptions h b (fallbackProxy redirectHost redirectPort man) withRefresh registerContext
+--          runSettingsSocket settings skt app
+--    )
+
+obeliskApp :: ConnectionOptions -> StaticWidget () () -> Widget () () -> Application -> Middleware -> JSM () -> Bool -> IO Application
+obeliskApp opts h b backend middleware preEntry shouldReload = do
   html <- BSLC.fromStrict <$> indexHtml h
-  let entryPoint = mainWidget' b >> syncPoint
+  let entryPoint = preEntry >> mainWidget' b >> syncPoint
   jsaddle <- jsaddleOr opts entryPoint $ \req sendResponse -> case (W.requestMethod req, W.pathInfo req) of
     ("GET", []) -> sendResponse $ W.responseLBS H.status200 [("Content-Type", "text/html")] html
-    ("GET", ["jsaddle.js"]) -> sendResponse $ W.responseLBS H.status200 [("Content-Type", "application/javascript")] $ jsaddleJs False
+    ("GET", ["jsaddle.js"]) -> sendResponse $ W.responseLBS H.status200 [("Content-Type", "application/javascript")] $ jsaddleJs shouldReload
     _ -> backend req sendResponse
   -- Workaround jsaddleOr wanting to handle all websockets requests without
   -- having a chance for run to proxy non jsaddle websocket requests to the
   -- backend.
-  return $ \req sendResponse -> do
+  return . middleware $ \req sendResponse -> do
     if isWebSocketsReq req && not (null $ W.pathInfo req)
       then backend req sendResponse
       else jsaddle req sendResponse
