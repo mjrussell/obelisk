@@ -71,28 +71,22 @@ runWidget conf (h, b) = do
       redirectPort = _runConfig_redirectPort conf
       beforeMainLoop = do
         putStrLn $ "Frontend running on " <> T.unpack (URI.render uri)
-      settings = setPort port (setTimeout 3600 defaultSettings)
-  man <- newManager defaultManagerSettings
-  backend <- fallbackProxy redirectHost redirectPort man
-  if liveReload
-    then debugWrapper $ \withRefresh registerContext -> do
-      app <- obeliskApp defaultConnectionOptions h b backend withRefresh registerContext True
-      runSettings settings app
-    else do
-      app <- obeliskApp defaultConnectionOptions h b backend id (pure ()) False
-      runSettings settings app
-
--- TODO anyway we can get the original bracket/bindPortTCPRetry back in?
---  bracket
---    (bindPortTCPRetry settings (logPortBindErr port) (_runConfig_retryTimeout conf))
---    close
---    (\skt -> do
---        --app <- obeliskApp defaultConnectionOptions h b (fallbackProxy redirectHost redirectPort man)
---        --runSettingsSocket settings skt app)
---        debugWrapper $ \withRefresh registerContext -> do
---          app <- obeliskAppDebug defaultConnectionOptions h b (fallbackProxy redirectHost redirectPort man) withRefresh registerContext
---          runSettingsSocket settings skt app
---    )
+      settings = setBeforeMainLoop beforeMainLoop (setPort port (setTimeout 3600 defaultSettings))
+  bracket
+    (bindPortTCPRetry settings (logPortBindErr port) (_runConfig_retryTimeout conf))
+    close
+    (\ skt -> do
+      man <- newManager defaultManagerSettings
+      let backend = fallbackProxy redirectHost redirectPort man
+      if liveReload
+        -- FIXME: debugWrapper doesnt play well with runSettingsSocket it seems, using runSettings outside of the bindPortTCPRetry
+        -- does result in hotreloading, but ends up breaking proxying to the backend
+        then debugWrapper $ \withRefresh registerContext -> do
+          app <- obeliskApp defaultConnectionOptions h b backend withRefresh registerContext True
+          runSettingsSocket settings skt app
+        else do
+          app <- obeliskApp defaultConnectionOptions h b backend id (pure ()) False
+          runSettingsSocket settings skt app)
 
 obeliskApp :: ConnectionOptions -> StaticWidget () () -> Widget () () -> Application -> Middleware -> JSM () -> Bool -> IO Application
 obeliskApp opts h b backend middleware preEntry shouldReload = do
